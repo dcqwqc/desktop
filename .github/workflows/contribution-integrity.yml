@@ -1,0 +1,95 @@
+name: Contribution integrity
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - dev
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  attribution:
+    name: Attribution check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check introduced commit messages
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          head="$HEAD_SHA"
+          base="$BASE_SHA"
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$head"
+          fi
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base="$(git merge-base "$head" refs/remotes/origin/dev || true)"
+          fi
+          if [[ -n "$base" ]] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base" || true
+          fi
+          if [[ -n "$base" ]] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git rev-list "$head" --not "$base" > /tmp/commits-to-check
+          else
+            git rev-list -n 100 "$head" > /tmp/commits-to-check
+          fi
+          count=0
+          while IFS= read -r sha; do
+            [[ -n "$sha" ]] || continue
+            count=$((count + 1))
+            if git show -s --format=%B "$sha" |
+              grep -Eiq '^[[:space:]]*Co-Authored-By:.*(Claude|anthropic\.com)|^[[:space:]]*Claude-Session:|^[[:space:]]*Generated with Claude Code[[:space:]]*$'; then
+              echo "::error::Commit $sha has unexpected Claude attribution; review provenance and correct if inaccurate."
+              exit 1
+            fi
+          done < /tmp/commits-to-check
+          echo "Checked $count commits. No unexpected Claude attribution found."
+
+  independent-review:
+    name: Independent PR review
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a current independent approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('Missing pull request context');
+              return;
+            }
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100
+            });
+            const latestByReviewer = new Map();
+            for (const review of reviews) {
+              if (!review.user || review.user.login === pr.user.login) continue;
+              if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) {
+                latestByReviewer.set(review.user.login, review);
+              }
+            }
+            const currentApproval = [...latestByReviewer.values()].find(
+              review => review.state === 'APPROVED' && review.commit_id === pr.head.sha
+            );
+            if (!currentApproval) {
+              core.setFailed('An independent reviewer must approve the latest commit before merge.');
+            } else {
+              core.info('Current approval by ' + currentApproval.user.login);
+            }
